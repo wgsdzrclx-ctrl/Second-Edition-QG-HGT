@@ -19,6 +19,7 @@ from torch_geometric.nn import global_mean_pool
 from torch_geometric.utils import softmax
 
 from data.tep_hetero_graph import EDGE_TYPES, PROCESS_UNITS
+from .input_representation import SharedVariableTCN
 
 
 NODE_TYPES = ("sensor", "actuator", "process_unit")
@@ -480,7 +481,18 @@ class QCHGT(nn.Module):
         self.switches = config["switches"]
         self.loss_weights = config["loss_weights"]
         input_dim = int(config["input_dim"])
+        representation = config.get("representation", {})
+        self.fixed_standardization = bool(representation.get("fixed_standardization", False))
+        self.use_identity = bool(representation.get("identity", False))
+        self.use_temporal = bool(representation.get("temporal", False))
+        self.expected_scaler_fingerprint = representation.get("scaler_fingerprint")
+        if self.fixed_standardization and not self.expected_scaler_fingerprint:
+            raise ValueError("Load/fit the training scaler before constructing an enhanced QC-HGT.")
+        if self.use_temporal and not self.fixed_standardization:
+            raise ValueError("Temporal encoding requires fixed training-set scaling.")
         normalization = str(config["input_normalization"])
+        if self.fixed_standardization and normalization != "none":
+            raise ValueError("Fixed scaling requires input_normalization=none to retain amplitudes.")
         if normalization not in {"layer_norm", "none"}:
             raise ValueError("qc_hgt.input_normalization must be layer_norm or none.")
         self.input_normalization = nn.ModuleDict(
@@ -489,8 +501,29 @@ class QCHGT(nn.Module):
                 for node_type in NODE_TYPES
             }
         )
+        self.variable_embedding = None
+        self.unit_embedding = None
+        self.temporal_encoder = None
+        dimensions = {node_type: input_dim for node_type in NODE_TYPES}
+        if self.use_identity:
+            variable_dim = int(representation.get("variable_id_dim", 16))
+            unit_dim = int(representation.get("unit_id_dim", 8))
+            if variable_dim <= 0 or unit_dim <= 0:
+                raise ValueError("Identity embedding dimensions must be positive.")
+            self.variable_embedding = nn.Embedding(52, variable_dim)
+            self.unit_embedding = nn.Embedding(len(PROCESS_UNITS), unit_dim)
+            for node_type in NODE_TYPES:
+                dimensions[node_type] += unit_dim + (variable_dim if node_type != "process_unit" else 0)
+        if self.use_temporal:
+            self.temporal_encoder = SharedVariableTCN(
+                channels=int(representation.get("temporal_dim", 32)),
+                kernel_size=int(representation.get("temporal_kernel_size", 3)),
+                dilations=representation.get("temporal_dilations", [1, 2]),
+            )
+            for node_type in NODE_TYPES:
+                dimensions[node_type] += self.temporal_encoder.output_dim
         self.input_projection = nn.ModuleDict(
-            {node_type: nn.Linear(input_dim, self.hidden_dim) for node_type in NODE_TYPES}
+            {node_type: nn.Linear(dimensions[node_type], self.hidden_dim) for node_type in NODE_TYPES}
         )
         self.quality_estimator = QualityEstimator(config["quality"])
         self.layers = nn.ModuleList(
@@ -557,24 +590,61 @@ class QCHGT(nn.Module):
             quality_loss = F.mse_loss(sensor_reliability, target)
         return reliability, sensor_reliability, descriptors, quality_loss
 
+    def _temporal_inputs(self, data: HeteroData, negative: bool) -> dict[str, Tensor]:
+        result = {}
+        for node_type in ("sensor", "actuator"):
+            storage = data[node_type]
+            window_key = "temporal_negative_window" if negative else "input_window"
+            mask_key = "temporal_negative_mask" if negative else "input_mask"
+            if window_key not in storage or mask_key not in storage:
+                raise ValueError(f"Missing {node_type} {window_key}/{mask_key} for temporal encoding.")
+            result[node_type] = self.temporal_encoder(storage[window_key], storage[mask_key])
+        units = result["sensor"].new_zeros((data["process_unit"].num_nodes, self.temporal_encoder.output_dim))
+        counts = units.new_zeros((units.shape[0], 1))
+        for node_type, relation in (("sensor", "monitors"), ("actuator", "controls")):
+            source, target = data[(node_type, relation, "process_unit")].edge_index
+            units.index_add_(0, target, result[node_type][source])
+            counts.index_add_(0, target, counts.new_ones((target.numel(), 1)))
+        result["process_unit"] = units / counts.clamp_min(1)
+        return result
+
+    def _encode_inputs(self, data: HeteroData, negative: bool = False) -> dict[str, Tensor]:
+        temporal = self._temporal_inputs(data, negative) if self.use_temporal else {}
+        encoded = {}
+        for node_type in NODE_TYPES:
+            storage = data[node_type]
+            values = storage.temporal_negative_x if negative else storage.x
+            parts = [self.input_normalization[node_type](values)]
+            if self.use_identity:
+                if "unit_id" not in storage:
+                    raise ValueError("Identity encoding requires physical unit IDs.")
+                if node_type != "process_unit":
+                    if "variable_id" not in storage:
+                        raise ValueError("Identity encoding requires distinct physical variable IDs.")
+                    parts.append(self.variable_embedding(storage.variable_id.long()))
+                parts.append(self.unit_embedding(storage.unit_id.long()))
+            if self.use_temporal:
+                parts.append(temporal[node_type])
+            # With all switches off, this is the original seven-feature projection.
+            combined = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+            encoded[node_type] = self.input_projection[node_type](combined)
+        return encoded
+
     def forward(self, data: HeteroData) -> dict[str, Any]:
         if not isinstance(data, HeteroData):
             raise TypeError("QC-HGT requires PyG HeteroData; disable homogeneous_ablation.")
+        supplied_fingerprint = getattr(data, "scaler_fingerprint", None)
+        if self.fixed_standardization:
+            fingerprints = [supplied_fingerprint] if isinstance(supplied_fingerprint, str) else supplied_fingerprint
+            if not fingerprints or any(value != self.expected_scaler_fingerprint for value in fingerprints):
+                raise ValueError("Graph features and model must use the same saved training scaler.")
+        elif supplied_fingerprint is not None:
+            raise ValueError("A legacy model cannot silently consume standardized graph features.")
         reliability_dict, sensor_reliability, descriptors, quality_loss = self._reliability(data)
-        h_dict = {
-            node_type: self.input_projection[node_type](
-                self.input_normalization[node_type](data[node_type].x)
-            )
-            for node_type in NODE_TYPES
-        }
+        h_dict = self._encode_inputs(data)
         temporal_h_dict: dict[str, Tensor] | None = None
         if all(hasattr(data[node_type], "temporal_negative_x") for node_type in NODE_TYPES):
-            temporal_h_dict = {
-                node_type: self.input_projection[node_type](
-                    self.input_normalization[node_type](data[node_type].temporal_negative_x)
-                )
-                for node_type in NODE_TYPES
-            }
+            temporal_h_dict = self._encode_inputs(data, negative=True)
 
         layer_losses: list[Tensor] = []
         consistency_scores: dict[tuple[str, str, str], Tensor] = {}

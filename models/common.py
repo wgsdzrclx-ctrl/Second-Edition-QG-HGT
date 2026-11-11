@@ -184,6 +184,19 @@ def extended_x_dict(data: HeteroData) -> dict[str, Any]:
     result["__sensor_raw_window__"] = data["sensor"].raw_window
     result["__sensor_observed_mask__"] = data["sensor"].observed_mask
     result["__sensor_timestamp_delay__"] = data["sensor"].timestamp_delay
+    # Preserve optional representation inputs without changing legacy tensors.
+    result["__representation_attrs__"] = {
+        node_type: {
+            name: data[node_type][name]
+            for name in ("variable_id", "unit_id", "input_window", "input_mask", "temporal_negative_window", "temporal_negative_mask")
+            if name in data[node_type]
+        }
+        for node_type in NODE_TYPES
+    }
+    result["__actuator_raw_window__"] = data["actuator"].raw_window
+    result["__actuator_observed_mask__"] = data["actuator"].observed_mask
+    if hasattr(data, "scaler_fingerprint"):
+        result["__scaler_fingerprint__"] = data.scaler_fingerprint
     if hasattr(data["sensor"], "quality_target"):
         result["__quality_target_dict__"] = {
             node_type: data[node_type].quality_target for node_type in NODE_TYPES
@@ -214,6 +227,14 @@ def heterodata_from_inputs(
     data["sensor"].raw_window = x_dict["__sensor_raw_window__"]
     data["sensor"].observed_mask = x_dict["__sensor_observed_mask__"]
     data["sensor"].timestamp_delay = x_dict["__sensor_timestamp_delay__"]
+    if "__actuator_raw_window__" in x_dict:
+        data["actuator"].raw_window = x_dict["__actuator_raw_window__"]
+        data["actuator"].observed_mask = x_dict["__actuator_observed_mask__"]
+    for node_type, attributes in x_dict.get("__representation_attrs__", {}).items():
+        for name, value in attributes.items():
+            data[node_type][name] = value
+    if "__scaler_fingerprint__" in x_dict:
+        data.scaler_fingerprint = x_dict["__scaler_fingerprint__"]
     for edge_type, edge_index in edge_index_dict.items():
         data[edge_type].edge_index = edge_index
     if "__quality_target_dict__" in x_dict:

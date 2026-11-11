@@ -9,12 +9,15 @@ explicit modelling choice, not an official unique node mapping.
 from __future__ import annotations
 
 from itertools import permutations
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 from torch_geometric.data import Data, HeteroData
+
+if TYPE_CHECKING:
+    from .standardization import FixedVariableStandardizer
 
 
 PROCESS_UNITS = (
@@ -218,12 +221,25 @@ def build_tep_hetero_graph(
     sample: Data,
     graph_config: Mapping[str, Any],
     homogeneous: bool | None = None,
+    standardizer: FixedVariableStandardizer | None = None,
 ) -> HeteroData | Data:
     """Convert one Stage-1 window sample into a TEP HeteroData or Data graph."""
     validate_tep_mapping()
     if sample.x.shape[0] != 52:
         raise ValueError(f"Expected 52 TEP variables, got shape {tuple(sample.x.shape)}")
-    statistics = window_statistics(sample.x, sample.observed_mask, graph_config["statistics"])
+    representation = graph_config.get("representation", {})
+    fixed_scaling = bool(representation.get("fixed_standardization", False))
+    temporal = bool(representation.get("temporal", False))
+    identity = bool(representation.get("identity", False))
+    if fixed_scaling != (standardizer is not None):
+        raise ValueError("Graph scaling switch and supplied training scaler must agree.")
+    if temporal and not fixed_scaling:
+        raise ValueError("Temporal input requires fixed training-set scaling.")
+    # Scaling replaces invalid values with zero; retain validity before that
+    # replacement so filled NaN/Inf cannot become an observed zero downstream.
+    input_mask = sample.observed_mask.bool() & torch.isfinite(sample.x) if fixed_scaling else sample.observed_mask
+    input_window = standardizer.transform(sample.x, input_mask) if fixed_scaling else sample.x
+    statistics = window_statistics(input_window, input_mask, graph_config["statistics"])
     sensor_x = statistics[:41]
     actuator_x = statistics[41:]
     unit_features = []
@@ -250,6 +266,21 @@ def build_tep_hetero_graph(
     graph["actuator"].variable_index = torch.arange(1, 12, dtype=torch.long)
     graph["process_unit"].x = torch.stack(unit_features)
     graph["process_unit"].unit_index = torch.arange(len(PROCESS_UNITS), dtype=torch.long)
+    if fixed_scaling:
+        graph.scaler_fingerprint = standardizer.fingerprint
+    if identity or temporal:
+        # Attribute names intentionally avoid "index": IDs are not graph offsets.
+        unit_ids = {name: position for position, name in enumerate(PROCESS_UNITS)}
+        graph["sensor"].variable_id = torch.arange(41, dtype=torch.long)
+        graph["actuator"].variable_id = torch.arange(41, 52, dtype=torch.long)
+        graph["sensor"].unit_id = torch.tensor([unit_ids[XMEAS_TO_UNIT[i]] for i in range(1, 42)])
+        graph["actuator"].unit_id = torch.tensor([unit_ids[XMV_TO_UNIT[i]] for i in range(1, 12)])
+        graph["process_unit"].unit_id = torch.arange(len(PROCESS_UNITS), dtype=torch.long)
+    if temporal:
+        graph["sensor"].input_window = input_window[:41].clone()
+        graph["actuator"].input_window = input_window[41:].clone()
+        graph["sensor"].input_mask = input_mask[:41].clone()
+        graph["actuator"].input_mask = input_mask[41:].clone()
     for edge_type, edge_index in _process_edges().items():
         relation_id = EDGE_TYPE_TO_ID[edge_type]
         graph[edge_type].edge_index = edge_index
@@ -278,11 +309,17 @@ def build_tep_hetero_graph(
         graph["process_unit"].quality_target = torch.stack(unit_quality)[:, None]
         shift = int(graph_config["temporal_negative_shift"])
         shifted_window, shifted_mask = _shift_window_for_negative(
-            sample.x, sample.observed_mask, shift
+            sample.x, input_mask, shift
         )
+        shifted_input = standardizer.transform(shifted_window, shifted_mask) if fixed_scaling else shifted_window
         shifted_statistics = window_statistics(
-            shifted_window, shifted_mask, graph_config["statistics"]
+            shifted_input, shifted_mask, graph_config["statistics"]
         )
+        if temporal:
+            graph["sensor"].temporal_negative_window = shifted_input[:41].clone()
+            graph["actuator"].temporal_negative_window = shifted_input[41:].clone()
+            graph["sensor"].temporal_negative_mask = shifted_mask[:41].clone()
+            graph["actuator"].temporal_negative_mask = shifted_mask[41:].clone()
         graph["sensor"].temporal_negative_x = shifted_statistics[:41]
         graph["actuator"].temporal_negative_x = shifted_statistics[41:]
         shifted_units = []
@@ -323,17 +360,19 @@ class TEPGraphDataset(Dataset[HeteroData | Data]):
         window_dataset: Dataset[Data],
         graph_config: Mapping[str, Any],
         homogeneous: bool | None = None,
+        standardizer: FixedVariableStandardizer | None = None,
     ) -> None:
         self.window_dataset = window_dataset
         self.graph_config = graph_config
         self.homogeneous = homogeneous
+        self.standardizer = standardizer
 
     def __len__(self) -> int:
         return len(self.window_dataset)
 
     def __getitem__(self, index: int) -> HeteroData | Data:
         return build_tep_hetero_graph(
-            self.window_dataset[index], self.graph_config, self.homogeneous
+            self.window_dataset[index], self.graph_config, self.homogeneous, self.standardizer
         )
 
     def set_epoch(self, epoch: int) -> None:

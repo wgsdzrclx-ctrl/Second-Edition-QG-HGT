@@ -1,5 +1,9 @@
 # TEP 鲁棒故障诊断项目
 
+第二版仓库：[Second-Edition-QG-HGT](https://github.com/wgsdzrclx-ctrl/Second-Edition-QG-HGT)。本版包含累计输入改进与完整修改记录；目前仅通过静态检查，22项新增测试及模型试跑尚未执行，不代表已取得准确率提升。
+
+输入表示改进的 A/B/C/D 代码已编写，当前等待用户审查，尚未运行新模型或训练。参见[修改方向](docs/QC_HGT修改方向_审阅稿_20261108.md)、[逐步修改记录与待检查项](docs/QC_HGT代码修改记录_20261108.md)和[独立实验配置](configs/input_ablation.yaml)。原`stage2.yaml`/`stage5.yaml`仍默认使用原模型；新实验使用`scripts/run_input_ablation.py`，默认只显示计划，显式`--execute`才允许执行，首轮仅训练/验证。
+
 本项目实现 TEP 数据退化协议、异构过程图、QC-HGT 及阶段 4 全部基线。论文主实验使用 Rieth `extended500`（正常工况与 IDV1–IDV20，共 21 类）；Braatz 标准版仅用于数据加载兼容性验证，二者不会混合。
 
 ## 环境与配置

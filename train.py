@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import time
 from typing import Any, Mapping
 
 import torch
@@ -34,6 +35,8 @@ def fit(
     config: Mapping[str, Any],
     checkpoint_path: Path,
     logger: Any,
+    *,
+    checkpoint_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     training = config["training"]
     if training["optimizer"] != "adamw":
@@ -51,17 +54,23 @@ def fit(
     )
     monitor = str(training["early_stopping"]["metric"])
     history: list[dict[str, Any]] = []
+    record_diagnostics = bool(training.get("record_diagnostics", False))
     model.to(device)
     for epoch in range(int(training["epochs"])):
+        if record_diagnostics and device.type == "cuda":
+            torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
+        epoch_start = time.perf_counter()
         _set_dataset_epoch(train_loader.dataset, epoch)
         model.train()
         total_loss = 0.0
         total_examples = 0
+        component_totals: dict[str, float] = {}
         for batch in train_loader:
             batch = batch.to(device, non_blocking=True)
             target = batch.y.reshape(-1).long()
             optimizer.zero_grad(set_to_none=True)
-            logits, joint_loss, _ = forward_graph_batch(model, batch)
+            logits, joint_loss, model_output = forward_graph_batch(model, batch)
             loss = joint_loss if joint_loss is not None else criterion(logits, target)
             loss.backward()
             clip = training["gradient_clip_norm"]
@@ -70,6 +79,11 @@ def fit(
             optimizer.step()
             total_loss += float(loss.item()) * target.shape[0]
             total_examples += target.shape[0]
+            if record_diagnostics and model_output is not None:
+                for name in ("classification_loss", "quality_loss", "consistency_loss"):
+                    value = model_output.get(name)
+                    if value is not None:
+                        component_totals[name] = component_totals.get(name, 0.0) + float(value.detach().item()) * target.shape[0]
         train_loss = total_loss / total_examples
         validation = evaluate(
             model,
@@ -80,6 +94,15 @@ def fit(
             metric_config=config["evaluation"]["metrics"],
         )
         row = {"epoch": epoch + 1, "train_loss": train_loss, "validation": validation}
+        if record_diagnostics:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            row["diagnostics"] = {
+                "epoch_seconds_including_validation": time.perf_counter() - epoch_start,
+                "peak_cuda_memory_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0,
+                "train_loss_components": {name: value / total_examples for name, value in component_totals.items()},
+            }
+            logger.info("diagnostics epoch=%d values=%s", epoch + 1, row["diagnostics"])
         history.append(row)
         logger.info(
             "epoch=%d train_loss=%.6f val_loss=%.6f val_accuracy=%.6f val_macro_f1=%.6f",
@@ -87,11 +110,13 @@ def fit(
         )
         improved, should_stop = stopping.update(float(validation[monitor]))
         if improved:
-            save_checkpoint(checkpoint_path, model, optimizer, epoch + 1, validation)
+            save_checkpoint(checkpoint_path, model, optimizer, epoch + 1, validation,
+                            metadata=checkpoint_metadata)
         if should_stop:
             logger.info("early_stopping epoch=%d best_%s=%.6f", epoch + 1, monitor, stopping.best)
             break
-    best = load_checkpoint(checkpoint_path, model, device)
+    expected = checkpoint_metadata.get("experiment_fingerprint") if checkpoint_metadata is not None else None
+    best = load_checkpoint(checkpoint_path, model, device, expected_fingerprint=expected)
     return {"history": history, "best_epoch": int(best["epoch"]), "best_validation": best["metrics"]}
 
 

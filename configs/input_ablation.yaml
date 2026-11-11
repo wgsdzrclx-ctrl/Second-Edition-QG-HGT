@@ -1,0 +1,34 @@
+# First-stage cumulative input experiments. Running the CLI without --execute
+# only prints a plan; it does not load data, fit a scaler, or start training.
+stage5_config: stage5.yaml
+default_protocol: protocol_2
+default_seed: 0
+output_directory: ../results/qc_hgt_input_abcd
+
+standardization:
+  epsilon: 1.0e-6
+
+representation:
+  variable_id_dim: 16
+  unit_id_dim: 8
+  temporal_dim: 32
+  temporal_kernel_size: 3
+  temporal_dilations: [1, 2]
+
+groups:
+  A:
+    fixed_standardization: false
+    identity: false
+    temporal: false
+  B:
+    fixed_standardization: true
+    identity: false
+    temporal: false
+  C:
+    fixed_standardization: true
+    identity: true
+    temporal: false
+  D:
+    fixed_standardization: true
+    identity: true
+    temporal: true
