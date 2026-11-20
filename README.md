@@ -1,5 +1,7 @@
 # TEP 鲁棒故障诊断项目
 
+2026-11-20：补充实验 60/60 个任务已完成，论文两张主表及摘要、分析、结论已按完整测试结果更新。最新版见[实验完成版论文](papers/revision_20261120/README.md)（[PDF](papers/revision_20261120/manuscript.pdf) / [Word](papers/revision_20261120/manuscript.docx)）；下方早期运行记录保留其历史时点。
+
 第二版仓库：[Second-Edition-QG-HGT](https://github.com/wgsdzrclx-ctrl/Second-Edition-QG-HGT)。本版包含累计输入改进与完整修改记录；目前仅通过静态检查，22项新增测试及模型试跑尚未执行，不代表已取得准确率提升。
 
 输入表示改进的 A/B/C/D 代码已编写，当前等待用户审查，尚未运行新模型或训练。参见[修改方向](docs/QC_HGT修改方向_审阅稿_20261108.md)、[逐步修改记录与待检查项](docs/QC_HGT代码修改记录_20261108.md)和[独立实验配置](configs/input_ablation.yaml)。原`stage2.yaml`/`stage5.yaml`仍默认使用原模型；新实验使用`scripts/run_input_ablation.py`，默认只显示计划，显式`--execute`才允许执行，首轮仅训练/验证。

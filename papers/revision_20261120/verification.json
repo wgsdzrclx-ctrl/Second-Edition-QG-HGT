@@ -1,0 +1,16 @@
+{
+  "test_sources_verified": 60,
+  "docx_tables_including_relation_table": 7,
+  "embedded_figures": 3,
+  "pdf_pages": 10,
+  "visual_review_pages": [
+    5,
+    8
+  ],
+  "artifacts": {
+    "manuscript.md": "05bc96c587ee985a91461250a55883a42af9f589bdf0fd589970d343de6bbf32",
+    "manuscript.html": "067806582bf9a9d07dad7a739cba7e1c133a38bd59316c2d910b76df15dd1120",
+    "manuscript.docx": "8b4a549a355e13c3d17220e5324b03f0d59688567e7e1c3795dc24646851ea52",
+    "manuscript.pdf": "cbb3b4c41e6f23dae6e9026d68fb97e94f2dd2111d52f91d7d58070f25b1b1aa"
+  }
+}
